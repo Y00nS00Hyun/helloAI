@@ -4,8 +4,48 @@
 import pandas as pd
 import numpy as np
 from pathlib import Path
-from typing import Tuple, List, Dict
-import os
+from typing import Tuple, List, Optional
+import logging
+
+from utils.constants import LABEL_MAPPING
+
+logger = logging.getLogger(__name__)
+
+
+def load_single_dataset(file_path: Path) -> Optional[pd.DataFrame]:
+    """
+    단일 데이터셋 파일 로드
+
+    Args:
+        file_path: 파일 경로
+
+    Returns:
+        DataFrame 또는 None
+    """
+    if not file_path.exists():
+        return None
+
+    # 다양한 구분자 시도
+    for sep in [',', ';']:
+        try:
+            df = pd.read_csv(
+                file_path,
+                encoding='utf-8',
+                sep=sep,
+                on_bad_lines='skip'
+            )
+            return df
+        except Exception as e:
+            logger.debug(f"Failed to read {file_path} with sep='{sep}': {e}")
+            continue
+
+    # 마지막 시도 (자동 감지)
+    try:
+        df = pd.read_csv(file_path, encoding='utf-8', on_bad_lines='skip')
+        return df
+    except Exception as e:
+        logger.warning(f"Failed to read {file_path}: {e}")
+        return None
 
 
 def load_datasets(data_dir: str = "data") -> pd.DataFrame:
@@ -19,24 +59,14 @@ def load_datasets(data_dir: str = "data") -> pd.DataFrame:
         통합된 DataFrame
     """
     data_dir = Path(data_dir)
-    dfs = []
+    dfs: List[pd.DataFrame] = []
 
     # dataset_1.csv 및 dataset_2.csv (title, text 포함)
     for i in [1, 2]:
         file_path = data_dir / f"dataset_{i}.csv"
-        if file_path.exists():
-            try:
-                # 다양한 구분자 시도
-                df = pd.read_csv(file_path, encoding='utf-8',
-                                 sep=',', on_bad_lines='skip')
-            except:
-                try:
-                    df = pd.read_csv(file_path, encoding='utf-8',
-                                     sep=';', on_bad_lines='skip')
-                except:
-                    df = pd.read_csv(
-                        file_path, encoding='utf-8', on_bad_lines='skip')
+        df = load_single_dataset(file_path)
 
+        if df is not None:
             # title과 text를 결합
             if 'title' in df.columns and 'text' in df.columns:
                 df['text'] = df['title'].astype(
@@ -44,45 +74,37 @@ def load_datasets(data_dir: str = "data") -> pd.DataFrame:
             elif 'title' in df.columns:
                 df['text'] = df['title'].astype(str)
 
-            # label 컬럼 확인
+            # 필요한 컬럼만 선택
             if 'label' in df.columns:
                 dfs.append(df[['text', 'label']])
-            else:
-                # label이 없는 경우 (테스트 데이터 가능성)
+            elif 'text' in df.columns:
                 dfs.append(df[['text']])
 
     # dataset_3.csv (text만 존재)
     file_path = data_dir / "dataset_3.csv"
-    if file_path.exists():
-        try:
-            df = pd.read_csv(file_path, encoding='utf-8',
-                             sep=',', on_bad_lines='skip')
-        except:
-            try:
-                df = pd.read_csv(file_path, encoding='utf-8',
-                                 sep=';', on_bad_lines='skip')
-            except:
-                df = pd.read_csv(file_path, encoding='utf-8',
-                                 on_bad_lines='skip')
+    df = load_single_dataset(file_path)
 
-        if 'text' in df.columns:
-            if 'label' in df.columns:
-                dfs.append(df[['text', 'label']])
-            else:
-                dfs.append(df[['text']])
+    if df is not None and 'text' in df.columns:
+        if 'label' in df.columns:
+            dfs.append(df[['text', 'label']])
+        else:
+            dfs.append(df[['text']])
 
     # 모든 데이터프레임 결합
-    if dfs:
-        combined_df = pd.concat(dfs, ignore_index=True)
-
-        # 중복 제거
-        if 'label' in combined_df.columns:
-            combined_df = combined_df.drop_duplicates(
-                subset=['text'], keep='first')
-
-        return combined_df
-    else:
+    if not dfs:
+        logger.warning(f"No datasets found in {data_dir}")
         return pd.DataFrame()
+
+    combined_df = pd.concat(dfs, ignore_index=True)
+
+    # 중복 제거
+    if 'label' in combined_df.columns:
+        combined_df = combined_df.drop_duplicates(
+            subset=['text'],
+            keep='first'
+        )
+
+    return combined_df
 
 
 def preprocess_text(text: str) -> str:
@@ -99,15 +121,45 @@ def preprocess_text(text: str) -> str:
         return ""
 
     text = str(text)
-
-    # 기본 정제
     text = text.strip()
     text = ' '.join(text.split())  # 여러 공백을 하나로
 
     return text
 
 
-def split_train_val(df: pd.DataFrame, val_ratio: float = 0.2, random_state: int = 42) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def normalize_label(label: any) -> int:
+    """
+    라벨을 정수로 정규화 (Real=0, Fake=1)
+
+    Args:
+        label: 원본 라벨
+
+    Returns:
+        정규화된 라벨 (0 또는 1)
+    """
+    if pd.isna(label):
+        return 0
+
+    if isinstance(label, str):
+        label_lower = label.lower().strip()
+        if label_lower in ['fake', '1']:
+            return 1  # Fake = 1 (positive)
+        else:
+            return 0  # Real = 0 (negative)
+
+    # 숫자인 경우
+    try:
+        label_int = int(float(str(label)))
+        return 1 if label_int == 1 else 0
+    except (ValueError, TypeError):
+        return 0
+
+
+def split_train_val(
+    df: pd.DataFrame,
+    val_ratio: float = 0.2,
+    random_state: int = 42
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     학습/검증 데이터 분할
 
@@ -118,11 +170,13 @@ def split_train_val(df: pd.DataFrame, val_ratio: float = 0.2, random_state: int 
 
     Returns:
         (train_df, val_df)
+
+    Raises:
+        ValueError: label 컬럼이 없는 경우
     """
     if 'label' not in df.columns:
         raise ValueError("DataFrame에 'label' 컬럼이 없습니다.")
 
-    # 라벨별로 분할하여 불균형 고려
     from sklearn.model_selection import train_test_split
 
     train_df, val_df = train_test_split(
@@ -135,7 +189,9 @@ def split_train_val(df: pd.DataFrame, val_ratio: float = 0.2, random_state: int 
     return train_df.reset_index(drop=True), val_df.reset_index(drop=True)
 
 
-def prepare_data_for_training(df: pd.DataFrame) -> Tuple[List[str], List[int]]:
+def prepare_data_for_training(
+    df: pd.DataFrame
+) -> Tuple[List[str], Optional[List[int]]]:
     """
     학습을 위한 데이터 준비
 
@@ -143,22 +199,14 @@ def prepare_data_for_training(df: pd.DataFrame) -> Tuple[List[str], List[int]]:
         df: 데이터프레임
 
     Returns:
-        (texts, labels)
+        (texts, labels) - labels가 None일 수 있음
     """
     texts = df['text'].apply(preprocess_text).tolist()
 
-    if 'label' in df.columns:
-        # 라벨을 정수로 변환 (real=1, fake=0 또는 반대)
-        labels = []
-        for label in df['label']:
-            if isinstance(label, str):
-                if label.lower() in ['real', '1', 'true']:
-                    labels.append(1)
-                else:
-                    labels.append(0)
-            else:
-                labels.append(int(label))
-
-        return texts, labels
-    else:
+    if 'label' not in df.columns:
         return texts, None
+
+    # 라벨을 정수로 변환 (Real=0, Fake=1)
+    labels = df['label'].apply(normalize_label).tolist()
+
+    return texts, labels
