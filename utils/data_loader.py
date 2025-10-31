@@ -67,10 +67,10 @@ def load_datasets(data_dir: str = "data") -> pd.DataFrame:
         df = load_single_dataset(file_path)
 
         if df is not None:
-            # title과 text를 결합
+            # title과 text를 결합 (A. [SEP] 사용)
             if 'title' in df.columns and 'text' in df.columns:
                 df['text'] = df['title'].astype(
-                    str) + ' ' + df['text'].astype(str)
+                    str) + ' [SEP] ' + df['text'].astype(str)
             elif 'title' in df.columns:
                 df['text'] = df['title'].astype(str)
 
@@ -97,27 +97,56 @@ def load_datasets(data_dir: str = "data") -> pd.DataFrame:
 
     combined_df = pd.concat(dfs, ignore_index=True)
 
-    # 중복 제거
+    # 중복 제거 (E. 중복/누수 방지)
+    initial_count = len(combined_df)
     if 'label' in combined_df.columns:
+        # text 기준 중복 제거
         combined_df = combined_df.drop_duplicates(
             subset=['text'],
             keep='first'
         )
 
+        # 유사한 텍스트 제거 (간단한 버전: 정규화 후 중복 제거)
+        # 텍스트를 소문자로 변환하고 공백 정규화
+        combined_df['text_normalized'] = combined_df['text'].astype(
+            str).str.lower().str.strip()
+        combined_df['text_normalized'] = combined_df['text_normalized'].str.replace(
+            r'\s+', ' ', regex=True
+        )
+
+        # 정규화된 텍스트 기준으로도 중복 제거
+        combined_df = combined_df.drop_duplicates(
+            subset=['text_normalized'],
+            keep='first'
+        )
+
+        # 정규화 컬럼 제거
+        combined_df = combined_df.drop(
+            columns=['text_normalized'], errors='ignore')
+
+    final_count = len(combined_df)
+    removed_count = initial_count - final_count
+
+    if removed_count > 0:
+        logger.info(
+            f"Removed {removed_count} duplicate/similar samples "
+            f"({removed_count/initial_count*100:.1f}%)"
+        )
+
     return combined_df
 
 
-def combine_title_text(title: Optional[str], text: str, sep: str = " ") -> str:
+def combine_title_text(title: Optional[str], text: str, sep: str = " [SEP] ") -> str:
     """
     title과 text를 결합 (A. 입력 스키마 호환성)
 
     Args:
         title: 제목 (없으면 None)
         text: 본문
-        sep: 구분자
+        sep: 구분자 (기본값: " [SEP] ")
 
     Returns:
-        결합된 텍스트
+        결합된 텍스트 (title + [SEP] + text 또는 text만)
     """
     if title and title.strip():
         return f"{title.strip()}{sep}{text.strip()}"

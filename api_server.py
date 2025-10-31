@@ -7,6 +7,8 @@ import csv
 import io
 from pathlib import Path
 from typing import Optional, List, Dict, Any
+from datetime import datetime, timedelta
+from collections import defaultdict
 
 import torch
 import pandas as pd
@@ -18,7 +20,8 @@ from pydantic import BaseModel, Field
 from utils.data_loader import (
     load_datasets,
     split_train_val,
-    prepare_data_for_training
+    prepare_data_for_training,
+    combine_title_text
 )
 from utils.preprocessing import TextTokenizer
 from utils.metrics import calculate_metrics, find_optimal_threshold
@@ -39,6 +42,10 @@ app = FastAPI(title="Fake News Detection API", version="1.0.0")
 # API Key 인증 설정
 API_KEY = os.getenv("API_KEY", "your-api-key-here")
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+# H. 운영 안전장치 - Rate limiting (간단한 메모리 기반)
+_reload_model_calls: Dict[str, List[datetime]] = defaultdict(list)
+RATE_LIMIT_RELOAD_PER_MINUTE = 2
 
 
 def verify_api_key(
@@ -64,8 +71,35 @@ def verify_api_key(
     return api_key
 
 
+def check_rate_limit(client_id: str = "default") -> None:
+    """
+    Rate limit 확인 (H. 운영 안전장치)
+
+    Args:
+        client_id: 클라이언트 식별자
+
+    Raises:
+        HTTPException: Rate limit 초과 시
+    """
+    now = datetime.now()
+    # 1분 이상 된 기록 제거
+    _reload_model_calls[client_id] = [
+        call_time for call_time in _reload_model_calls[client_id]
+        if now - call_time < timedelta(minutes=1)
+    ]
+
+    if len(_reload_model_calls[client_id]) >= RATE_LIMIT_RELOAD_PER_MINUTE:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Rate limit exceeded. Maximum {RATE_LIMIT_RELOAD_PER_MINUTE} calls per minute."
+        )
+
+    _reload_model_calls[client_id].append(now)
+
+
 # 전역 변수
 model: Optional[torch.nn.Module] = None
+previous_model_state: Optional[Dict] = None  # H. 롤백용
 tokenizer: Optional[TextTokenizer] = None
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 model_config: Optional[Dict[str, Any]] = None
@@ -77,7 +111,8 @@ optimal_threshold: float = 0.5  # 기본값, 학습 시 업데이트됨
 class TextRequest(BaseModel):
     """단일 텍스트 추론 요청 (A. 입력 스키마 호환성)"""
     text: str = Field(..., description="뉴스 본문 텍스트 (필수)")
-    title: Optional[str] = Field(None, description="뉴스 제목 (선택사항, 있으면 함께 사용)")
+    title: Optional[str] = Field(
+        None, description="뉴스 제목 (선택사항, 있으면 [SEP]로 결합)")
 
 
 class TextResponse(BaseModel):
@@ -88,27 +123,11 @@ class TextResponse(BaseModel):
     threshold: float = Field(..., description="사용된 분류 임계값")
 
 
-def combine_title_text(title: Optional[str], text: str, sep: str = " ") -> str:
-    """
-    title과 text를 결합 (A. 입력 스키마 호환성)
-
-    Args:
-        title: 제목 (없으면 None)
-        text: 본문
-        sep: 구분자
-
-    Returns:
-        결합된 텍스트
-    """
-    if title and title.strip():
-        return f"{title.strip()}{sep}{text.strip()}"
-    return text.strip()
-
-
 def load_model(
     model_path: str = "models/best.pt",
     model_type_param: Optional[str] = None,
-    config: Optional[Dict[str, Any]] = None
+    config: Optional[Dict[str, Any]] = None,
+    save_backup: bool = True
 ) -> None:
     """
     모델 로드
@@ -117,16 +136,25 @@ def load_model(
         model_path: 모델 파일 경로
         model_type_param: 모델 타입
         config: 설정 딕셔너리
+        save_backup: 이전 모델 백업 저장 여부 (H. 롤백용)
 
     Raises:
         FileNotFoundError: 모델 파일이 없는 경우
         ValueError: 모델 타입이 잘못된 경우
     """
-    global model, tokenizer, model_config, model_type, optimal_threshold
+    global model, tokenizer, model_config, model_type, optimal_threshold, previous_model_state
 
     model_path_obj = Path(model_path)
     if not model_path_obj.exists():
         raise FileNotFoundError(f"Model file not found: {model_path}")
+
+    # H. 롤백용 - 현재 모델 상태 저장
+    if model is not None and save_backup:
+        try:
+            previous_model_state = model.state_dict().copy()
+            logger.info("Previous model state saved for rollback")
+        except Exception as e:
+            logger.warning(f"Could not save previous model state: {e}")
 
     # 모델 타입 및 설정 확인
     if not model_type_param:
@@ -170,36 +198,57 @@ def load_model(
         'model', {}
     ).get('vocab_size', 30000)
 
-    model = create_model(
-        model_name=model_type_param,
-        vocab_size=vocab_size,
-        config=config,
-        device=device
-    )
+    try:
+        model = create_model(
+            model_name=model_type_param,
+            vocab_size=vocab_size,
+            config=config,
+            device=device
+        )
 
-    # 모델 가중치 로드
-    model.load_state_dict(
-        torch.load(model_path_obj, map_location=device)
-    )
-    model = model.to(device)
-    model.eval()
+        # 모델 가중치 로드
+        model.load_state_dict(
+            torch.load(model_path_obj, map_location=device)
+        )
+        model = model.to(device)
+        model.eval()
 
-    # 메타데이터에서 optimal_threshold 로드
-    metadata_path = model_path_obj.parent / 'metadata.json'
-    if metadata_path.exists():
-        import json
-        try:
-            with open(metadata_path, 'r', encoding='utf-8') as f:
-                metadata = json.load(f)
-                optimal_threshold = metadata.get('optimal_threshold', 0.5)
-                logger.info(
-                    f"Loaded optimal threshold: {optimal_threshold:.4f}")
-        except Exception as e:
-            logger.warning(f"Could not load metadata: {e}")
+        # 메타데이터에서 optimal_threshold 로드
+        metadata_path = model_path_obj.parent / 'metadata.json'
+        if metadata_path.exists():
+            import json
+            try:
+                with open(metadata_path, 'r', encoding='utf-8') as f:
+                    metadata = json.load(f)
+                    optimal_threshold = metadata.get('optimal_threshold', 0.5)
+                    selection_criterion = metadata.get(
+                        'selection_criterion', 'macro_f1')
+                    logger.info(
+                        f"Loaded optimal threshold: {optimal_threshold:.4f} "
+                        f"(selection criterion: {selection_criterion})"
+                    )
+            except Exception as e:
+                logger.warning(f"Could not load metadata: {e}")
 
-    logger.info(f"Model loaded from {model_path}")
-    logger.info(f"Model type: {model_type}")
-    logger.info(f"Device: {device}")
+        logger.info(f"Model loaded from {model_path}")
+        logger.info(f"Model type: {model_type}")
+        logger.info(f"Device: {device}")
+
+    except Exception as e:
+        # H. 롤백 처리
+        logger.error(f"Failed to load model: {e}")
+        if previous_model_state is not None and save_backup:
+            try:
+                if model is not None:
+                    model.load_state_dict(previous_model_state)
+                    logger.info("Rolled back to previous model state")
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Model loading failed. Rolled back to previous model. Error: {str(e)}"
+                )
+            except Exception:
+                pass
+        raise
 
 
 def predict_text(
@@ -229,7 +278,7 @@ def predict_text(
             detail="Model not loaded. Please reload model first."
         )
 
-    # title과 text 결합 (A. 입력 스키마 호환성)
+    # title과 text 결합 (A. 입력 스키마 호환성 - [SEP] 사용)
     combined_text = combine_title_text(title, text)
 
     if threshold is None:
@@ -271,10 +320,10 @@ async def infer(
     api_key: str = Depends(verify_api_key)
 ) -> TextResponse:
     """
-    단일 텍스트 추론 (A. title+text 지원)
+    단일 텍스트 추론 (A. title+text 지원, [SEP]로 결합)
 
     - **text**: 판별할 뉴스 본문 텍스트 (필수)
-    - **title**: 뉴스 제목 (선택사항, 있으면 자동으로 결합하여 사용)
+    - **title**: 뉴스 제목 (선택사항, 있으면 "title [SEP] text" 형태로 결합)
     """
     try:
         result = predict_text(request.text, request.title)
@@ -294,20 +343,32 @@ def read_csv_robust(file_content: bytes) -> pd.DataFrame:
 
     Returns:
         DataFrame
+
+    Raises:
+        HTTPException: CSV 파싱 실패 시
     """
     # 여러 방법 시도
     encodings = ['utf-8', 'utf-8-sig', 'cp949', 'latin-1']
     separators = [',', ';', '\t']
 
+    errors = []
+    empty_row_count = 0
+
     for encoding in encodings:
         for sep in separators:
             try:
                 file_str = file_content.decode(encoding)
-                # csv.Sniffer로 구분자 감지 시도
-                sniffer = csv.Sniffer()
-                sample = file_str[:1024]
-                detected_delimiter = sniffer.sniff(sample).delimiter
 
+                # csv.Sniffer로 구분자 감지 시도
+                try:
+                    sniffer = csv.Sniffer()
+                    sample = file_str[:1024] if len(
+                        file_str) > 1024 else file_str
+                    detected_delimiter = sniffer.sniff(sample).delimiter
+                except:
+                    detected_delimiter = sep
+
+                # pandas engine='python'으로 안전하게 읽기
                 df = pd.read_csv(
                     io.StringIO(file_str),
                     sep=detected_delimiter,
@@ -315,23 +376,64 @@ def read_csv_robust(file_content: bytes) -> pd.DataFrame:
                     engine='python',
                     on_bad_lines='skip',
                     quotechar='"',
-                    quoting=csv.QUOTE_MINIMAL
+                    quoting=csv.QUOTE_MINIMAL,
+                    skipinitialspace=True
                 )
+
+                if df.empty:
+                    empty_row_count += 1
+                    errors.append(
+                        f"Empty DataFrame with encoding={encoding}, sep={detected_delimiter}")
+                    continue
+
+                # 빈 행 제거
+                df = df.dropna(how='all')
+
                 if not df.empty:
+                    logger.info(
+                        f"Successfully parsed CSV: {len(df)} rows, "
+                        f"encoding={encoding}, delimiter='{detected_delimiter}'"
+                    )
                     return df
+
             except Exception as e:
+                errors.append(f"encoding={encoding}, sep={sep}: {str(e)}")
                 logger.debug(
                     f"Failed with encoding={encoding}, sep={sep}: {e}")
                 continue
 
-    # 최종 시도
+    # 최종 시도 (기본 설정)
     try:
-        return pd.read_csv(io.BytesIO(file_content), encoding='utf-8', on_bad_lines='skip')
-    except Exception as e:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Could not parse CSV file: {str(e)}"
+        df = pd.read_csv(
+            io.BytesIO(file_content),
+            encoding='utf-8',
+            engine='python',
+            on_bad_lines='skip'
         )
+        df = df.dropna(how='all')
+        if not df.empty:
+            return df
+    except Exception as e:
+        errors.append(f"Final attempt: {str(e)}")
+
+    # 실패 시 명확한 에러 메시지 (F. 에러 메시지 개선)
+    error_detail = f"CSV 파싱 실패. 시도한 방법들:\n"
+    error_detail += "\n".join(f"- {err}" for err in errors[:5])  # 최대 5개만 표시
+    if empty_row_count > 0:
+        error_detail += f"\n빈 DataFrame {empty_row_count}회 발생."
+    error_detail += "\n지원 형식: UTF-8/CP949 인코딩, 쉼표/세미콜론 구분자, 큰따옴표 포함 텍스트."
+
+    raise HTTPException(
+        status_code=400,
+        detail=error_detail
+    )
+
+
+class CSVResponse(BaseModel):
+    """CSV 추론 응답"""
+    predictions: List[Dict[str, Any]]
+    total: int
+    empty_rows_removed: int = Field(0, description="제거된 빈 행 수")
 
 
 @app.post("/infer_csv", response_model=CSVResponse)
@@ -362,35 +464,59 @@ async def infer_csv(
         if df.empty:
             raise HTTPException(
                 status_code=400,
-                detail="CSV file is empty or could not be parsed"
+                detail="CSV file is empty or could not be parsed. Please check file format."
             )
+
+        # 빈 행 카운트
+        empty_rows = df.isna().all(axis=1).sum()
+        if empty_rows > 0:
+            logger.warning(f"Found {empty_rows} empty rows in CSV")
+            df = df.dropna(how='all')
 
         # 컬럼 자동 탐지 (F. CSV 처리 견고화)
-        has_title = 'title' in df.columns
-        has_text = 'text' in df.columns
+        available_columns = [col.lower() for col in df.columns]
+        has_title = 'title' in df.columns or 'title' in available_columns
+        has_text = 'text' in df.columns or 'text' in available_columns
 
-        if not has_text:
+        # 대소문자 무시하고 컬럼 매핑
+        text_col = None
+        title_col = None
+
+        for col in df.columns:
+            col_lower = col.lower()
+            if col_lower == 'text' and text_col is None:
+                text_col = col
+            elif col_lower == 'title' and title_col is None:
+                title_col = col
+
+        if text_col is None:
             raise HTTPException(
                 status_code=400,
-                detail="CSV file must contain 'text' column. Available columns: " +
-                       ", ".join(df.columns.tolist())
+                detail=(
+                    f"CSV file must contain 'text' column. "
+                    f"Available columns: {', '.join(df.columns.tolist())}. "
+                    f"Empty rows: {empty_rows}개 제거됨."
+                )
             )
 
-        # title과 text 결합 처리
-        if has_title:
+        # title과 text 결합 처리 (F. CSV 처리 견고화)
+        if title_col:
             texts = [
                 combine_title_text(
                     title if pd.notna(title) else None,
                     text
                 )
-                for title, text in zip(df['title'], df['text'])
+                for title, text in zip(df[title_col], df[text_col])
             ]
+            logger.info(
+                f"Using columns: title='{title_col}', text='{text_col}'")
         else:
-            texts = df['text'].astype(str).tolist()
+            texts = df[text_col].astype(str).tolist()
+            logger.info(f"Using column: text='{text_col}'")
 
         predictions: List[Dict[str, Any]] = []
 
-        # 청크 처리로 메모리 보호 (F. CSV 처리 견고화)
+        # 청크 처리로 메모리 보호 (F. CSV 처리 견고화 - 10k 라인 단위)
         chunk_size = 10000  # 10k 라인 단위
         batch_size = 32
 
@@ -445,7 +571,11 @@ async def infer_csv(
 
                     predictions.append(result)
 
-        return CSVResponse(predictions=predictions, total=len(predictions))
+        return CSVResponse(
+            predictions=predictions,
+            total=len(predictions),
+            empty_rows_removed=empty_rows
+        )
 
     except HTTPException:
         raise
@@ -461,21 +591,31 @@ async def reload_model(
     api_key: str = Depends(verify_api_key)
 ) -> Dict[str, str]:
     """
-    모델 다시 불러오기
+    모델 다시 불러오기 (H. Rate limit 적용)
 
     - **model_path**: 모델 파일 경로 (기본값: models/best.pt)
     - **model_type**: 모델 타입 ('bilstm' or 'cnn')
+
+    Rate limit: 분당 최대 2회
     """
+    # H. Rate limit 확인
+    try:
+        check_rate_limit()
+    except HTTPException:
+        raise
+
     try:
         config = load_config(model_name=model_type)
-        load_model(model_path, model_type, config)
+        load_model(model_path, model_type, config, save_backup=True)
         return {
             "status": "success",
             "message": f"Model loaded from {model_path}",
-            "optimal_threshold": optimal_threshold
+            "optimal_threshold": optimal_threshold,
+            "selection_criterion": "macro_f1"
         }
     except Exception as e:
         logger.error(f"Error in /reload_model: {e}", exc_info=True)
+        # H. 롤백은 load_model 내부에서 처리됨
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -526,6 +666,7 @@ async def validate(
         label_mapping_info = {
             "0": "Real (negative)",
             "1": "Fake (positive)",
+            "pos_label": "fake(1)",  # B. 가시화 강화
             "unique_labels_in_data": unique_labels,
             "label_distribution": {
                 str(label): int(sum(1 for l in val_labels if l == label))
@@ -576,11 +717,24 @@ async def validate(
         return {
             "status": "success",
             "metrics": metrics,
+            "macro_f1": float(metrics['macro_f1']),  # B. 명시적 표기
             "optimal_threshold": float(optimal_threshold),
             "optimal_threshold_metrics": optimal_metrics,
             "current_threshold_metrics": metrics,
-            "label_mapping": label_mapping_info,  # B. 라벨 매핑 정보
-            "num_samples": len(val_df)
+            "label_mapping": {
+                "0": "Real (negative)",
+                "1": "Fake (positive)",
+                "pos_label": "fake(1)",  # B. 가시화 강화
+                "validation_info": label_mapping_info
+            },
+            "class_metrics": {  # B. 클래스별 메트릭 명시
+                "f1_real": float(metrics['f1_real']),
+                "f1_fake": float(metrics['f1_fake']),
+                "f1_macro": float(metrics['macro_f1'])
+            },
+            "selection_criterion": "macro_f1",  # B. 모델 선택 기준 명시
+            "num_samples": len(val_df),
+            "confusion_matrix": metrics.get('confusion_matrix', {})
         }
 
     except HTTPException:
@@ -592,12 +746,14 @@ async def validate(
 
 @app.get("/health")
 async def health() -> Dict[str, Any]:
-    """헬스 체크 (API Key 불필요)"""
+    """헬스 체크 (API Key 불필요, H. 공개 OK)"""
     return {
         "status": "healthy",
         "model_loaded": model is not None,
         "device": str(device),
-        "optimal_threshold": optimal_threshold
+        "optimal_threshold": optimal_threshold,
+        "model_type": model_type,
+        "selection_criterion": "macro_f1"
     }
 
 
@@ -607,10 +763,10 @@ async def root() -> Dict[str, Any]:
     return {
         "message": "Fake News Detection API",
         "endpoints": [
-            "POST /infer - 단일 텍스트 추론 (title+text 지원)",
-            "POST /infer_csv - CSV 파일 일괄 추론",
-            "POST /reload_model - 모델 다시 불러오기",
-            "POST /validate - 검증 데이터 평가",
+            "POST /infer - 단일 텍스트 추론 (title+text 지원, [SEP] 결합)",
+            "POST /infer_csv - CSV 파일 일괄 추론 (title 자동 탐지, only_prediction 옵션)",
+            "POST /reload_model - 모델 다시 불러오기 (rate limit: 2회/분)",
+            "POST /validate - 검증 데이터 평가 (최적 임계값 계산)",
             "GET /health - 헬스 체크"
         ],
         "note": "All POST endpoints require X-API-Key header",
@@ -628,7 +784,7 @@ async def startup_event() -> None:
     if model_path.exists():
         try:
             config = load_config(model_name='bilstm')
-            load_model(str(model_path), 'bilstm', config)
+            load_model(str(model_path), 'bilstm', config, save_backup=False)
             logger.info("Model loaded on startup")
         except Exception as e:
             logger.warning(f"Failed to load model on startup: {e}")

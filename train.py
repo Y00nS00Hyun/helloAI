@@ -214,12 +214,35 @@ def validate(
     return avg_loss, metrics, probs
 
 
+def get_git_sha() -> Optional[str]:
+    """
+    Git SHA 값 가져오기 (G. 재현성 강화)
+
+    Returns:
+        Git SHA 문자열 또는 None
+    """
+    try:
+        import subprocess
+        result = subprocess.run(
+            ['git', 'rev-parse', 'HEAD'],
+            capture_output=True,
+            text=True,
+            cwd=Path(__file__).parent
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
 def save_metadata(
     model_path: Path,
     config: Dict[str, Any],
     metrics: Dict[str, float],
     optimal_threshold: float,
-    seed: int
+    seed: int,
+    selection_criterion: str = "macro_f1"
 ) -> None:
     """
     학습 메타데이터 저장 (G. 재현성 강화)
@@ -230,6 +253,7 @@ def save_metadata(
         metrics: 평가 메트릭
         optimal_threshold: 최적 임계값
         seed: 사용된 시드
+        selection_criterion: 모델 선택 기준 (기본값: "macro_f1")
     """
     metadata = {
         'model_path': str(model_path),
@@ -237,13 +261,20 @@ def save_metadata(
         'metrics': metrics,
         'optimal_threshold': optimal_threshold,
         'seed': seed,
-        'macro_f1': metrics.get('macro_f1', 0.0)
+        'selection_criterion': selection_criterion,  # 모델 선택 기준 명시
+        'macro_f1': metrics.get('macro_f1', 0.0),
+        'label_mapping': {
+            '0': 'Real (negative)',
+            '1': 'Fake (positive)'
+        },
+        'git_sha': get_git_sha()  # Git SHA 추가
     }
 
     metadata_path = model_path.parent / 'metadata.json'
     with open(metadata_path, 'w', encoding='utf-8') as f:
         json.dump(metadata, f, indent=2, ensure_ascii=False)
     logger.info(f"Metadata saved to {metadata_path}")
+    logger.info(f"Model selection criterion: {selection_criterion} (macro_f1)")
 
 
 def main():
@@ -460,7 +491,8 @@ def main():
                 config,
                 optimal_metrics,
                 optimal_threshold,
-                args.seed
+                args.seed,
+                selection_criterion="macro_f1"  # B. 모델 선택 기준 명시
             )
 
             logger.info(f"✓ Best model saved! Macro F1: {best_f1:.4f}")

@@ -119,12 +119,12 @@ headers = {"X-API-Key": "your-api-key-here"}
 # 모델 리로드
 requests.post("http://localhost:8000/reload_model", headers=headers)
 
-# 단일 텍스트 추론 (A. title+text 지원)
+# 단일 텍스트 추론 (A. title+text 지원, [SEP]로 결합)
 response = requests.post(
     "http://localhost:8000/infer",
     json={
         "text": "뉴스 본문...",
-        "title": "뉴스 제목"  # 선택사항
+        "title": "뉴스 제목"  # 선택사항, 있으면 "title [SEP] text" 형태로 결합
     },
     headers=headers
 )
@@ -162,10 +162,11 @@ API 문서 및 테스트:
 - 사전학습 없음
 - Attention mask를 이용한 평균 풀링
 
-### CNN 모델 (Transformer 옵션)
-- 순수 PyTorch 구현
+### CNN 모델 (C. 모델명 명확화)
+- 순수 PyTorch 구현 (사전학습 없음)
 - Embedding + CNN 필터 (3, 4, 5) + 분류기
-- 사전학습 없음
+- 모델 이름: `cnn` (권장) 또는 `transformer` (호환성 유지)
+- **주의**: 실제 Transformer가 아닌 TextCNN 구현입니다
 
 ### 새 모델 추가하기
 1. `model_definitions/my_model.py` 파일 생성
