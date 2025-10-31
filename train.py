@@ -15,7 +15,7 @@ import os
 from utils.data_loader import load_datasets, split_train_val, prepare_data_for_training
 from utils.preprocessing import TextTokenizer
 from utils.metrics import calculate_metrics, print_classification_report
-from model_definitions import BiLSTMModel, TransformerModel
+from model_definitions import MODEL_REGISTRY
 
 
 class NewsDataset(Dataset):
@@ -215,12 +215,17 @@ def main():
         num_workers=0
     )
     
-    # 모델 생성 (사전학습 모델 없이)
+    # 모델 생성 (레지스트리에서 가져오기)
+    if args.model not in MODEL_REGISTRY:
+        raise ValueError(f"Unknown model: {args.model}. Available models: {list(MODEL_REGISTRY.keys())}")
+    
     model_config = config['model']
     vocab_size = len(tokenizer.tokenizer.word_to_idx)
+    ModelClass = MODEL_REGISTRY[args.model]
     
+    # 모델별 파라미터 설정
     if args.model == 'bilstm':
-        model = BiLSTMModel(
+        model = ModelClass(
             vocab_size=vocab_size,
             embedding_dim=model_config.get('embedding_dim', 300),
             hidden_dim=model_config.get('hidden_dim', 256),
@@ -230,12 +235,24 @@ def main():
         )
     elif args.model == 'transformer':
         # CNN 모델 사용 (Transformer 대신)
-        model = TransformerModel(
+        model = ModelClass(
             model_name=None,
             num_classes=model_config.get('num_classes', 2),
             dropout=model_config.get('dropout', 0.3),
             vocab_size=vocab_size
         )
+    else:
+        # 다른 모델의 경우 기본 파라미터로 생성 시도
+        try:
+            model = ModelClass(
+                vocab_size=vocab_size,
+                num_classes=model_config.get('num_classes', 2),
+                dropout=model_config.get('dropout', 0.3),
+                **{k: v for k, v in model_config.items() if k != 'name'}
+            )
+        except TypeError:
+            # 파라미터가 맞지 않으면 에러 메시지 출력
+            raise ValueError(f"Model {args.model} requires specific parameters. Check model definition.")
     
     model = model.to(device)
     print(f"Model: {args.model}")
@@ -278,22 +295,22 @@ def main():
         
         # 학습
         train_loss, train_metrics = train_epoch(model, train_loader, criterion, optimizer, device)
-        print(f"Train Loss: {train_loss:.4f}, F1: {train_metrics['f1_score']:.4f}")
+        print(f"Train Loss: {train_loss:.4f}, Macro F1: {train_metrics['macro_f1']:.4f}")
         
         # 검증
         val_loss, val_metrics = validate(model, val_loader, criterion, device)
-        print(f"Val Loss: {val_loss:.4f}, F1: {val_metrics['f1_score']:.4f}")
+        print(f"Val Loss: {val_loss:.4f}, Macro F1: {val_metrics['macro_f1']:.4f}")
         
         # 스케줄러 업데이트
         if scheduler:
             scheduler.step()
             print(f"Learning Rate: {scheduler.get_last_lr()[0]:.6f}")
         
-        # 최고 모델 저장
-        if val_metrics['f1_score'] > best_f1 + min_delta:
-            best_f1 = val_metrics['f1_score']
+        # 최고 모델 저장 (Macro F1 Score 기준)
+        if val_metrics['macro_f1'] > best_f1 + min_delta:
+            best_f1 = val_metrics['macro_f1']
             torch.save(model.state_dict(), 'models/best.pt')
-            print(f"✓ Best model saved! F1: {best_f1:.4f}")
+            print(f"✓ Best model saved! Macro F1: {best_f1:.4f}")
             patience_counter = 0
         else:
             patience_counter += 1
@@ -305,14 +322,16 @@ def main():
     
     print("\n" + "="*50)
     print("Training Completed!")
-    print(f"Best F1 Score: {best_f1:.4f}")
+    print(f"Best Macro F1 Score: {best_f1:.4f}")
     print("="*50)
     
     # 최종 검증 리포트
     model.load_state_dict(torch.load('models/best.pt'))
     val_loss, val_metrics = validate(model, val_loader, criterion, device)
     print("\nFinal Validation Results:")
-    print(f"F1 Score: {val_metrics['f1_score']:.4f}")
+    print(f"Macro F1 Score (대회 평가 기준): {val_metrics['macro_f1']:.4f}")
+    print(f"F1 Real: {val_metrics['f1_real']:.4f}")
+    print(f"F1 Fake: {val_metrics['f1_fake']:.4f}")
     print(f"Accuracy: {val_metrics['accuracy']:.4f}")
     print(f"Precision: {val_metrics['precision']:.4f}")
     print(f"Recall: {val_metrics['recall']:.4f}")

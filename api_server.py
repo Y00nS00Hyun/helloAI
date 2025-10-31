@@ -15,7 +15,7 @@ import os
 from utils.data_loader import load_datasets, split_train_val, prepare_data_for_training
 from utils.preprocessing import TextTokenizer
 from utils.metrics import calculate_metrics
-from model_definitions import BiLSTMModel, TransformerModel
+from model_definitions import MODEL_REGISTRY
 from train import NewsDataset
 
 app = FastAPI(title="Fake News Detection API", version="1.0.0")
@@ -117,12 +117,19 @@ def load_model(model_path: str = "models/best.pt", model_type_param: str = None,
         print(f"Warning: Could not build vocabulary: {e}")
         # 기본 어휘 사용
 
-    # 모델 생성
+    # 모델 생성 (레지스트리에서 가져오기)
+    if model_type_param not in MODEL_REGISTRY:
+        raise ValueError(
+            f"Unknown model type: {model_type_param}. Available: {list(MODEL_REGISTRY.keys())}")
+
+    ModelClass = MODEL_REGISTRY[model_type_param]
     model_config_dict = config.get('model', {})
+    vocab_size = len(tokenizer.tokenizer.word_to_idx) if hasattr(tokenizer.tokenizer,
+                                                                 'word_to_idx') and tokenizer.tokenizer.word_to_idx else model_config_dict.get('vocab_size', 30000)
+
     if model_type_param == 'bilstm':
-        model = BiLSTMModel(
-            vocab_size=tokenizer.tokenizer.vocab_size if hasattr(
-                tokenizer.tokenizer, 'vocab_size') else model_config_dict.get('vocab_size', 30000),
+        model = ModelClass(
+            vocab_size=vocab_size,
             embedding_dim=model_config_dict.get('embedding_dim', 300),
             hidden_dim=model_config_dict.get('hidden_dim', 256),
             num_layers=model_config_dict.get('num_layers', 2),
@@ -131,15 +138,24 @@ def load_model(model_path: str = "models/best.pt", model_type_param: str = None,
         )
     elif model_type_param == 'transformer' or model_type_param == 'cnn':
         # CNN 모델 사용
-        vocab_size = len(tokenizer.tokenizer.word_to_idx) if hasattr(
-            tokenizer.tokenizer, 'word_to_idx') and tokenizer.tokenizer.word_to_idx else model_config_dict.get('vocab_size', 30000)
-        model = TransformerModel(
+        model = ModelClass(
             model_name=None,
             num_classes=model_config_dict.get('num_classes', 2),
-            dropout=model_config_dict.get('dropout', 0.3)
+            dropout=model_config_dict.get('dropout', 0.3),
+            vocab_size=vocab_size
         )
     else:
-        raise ValueError(f"Unknown model type: {model_type_param}")
+        # 다른 모델의 경우 기본 파라미터로 생성 시도
+        try:
+            model = ModelClass(
+                vocab_size=vocab_size,
+                num_classes=model_config_dict.get('num_classes', 2),
+                dropout=model_config_dict.get('dropout', 0.3),
+                **{k: v for k, v in model_config_dict.items() if k not in ['name', 'model_name']}
+            )
+        except TypeError as e:
+            raise ValueError(
+                f"Model {model_type_param} requires specific parameters. Error: {e}")
 
     # 모델 가중치 로드
     model.load_state_dict(torch.load(model_path, map_location=device))
