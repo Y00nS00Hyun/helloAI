@@ -1,0 +1,36 @@
+# BiLSTM 모델 설정 (사전학습 모델 없이)
+
+model:
+  name: bilstm
+  vocab_size: 30000 # 실제로는 학습 시 자동 설정됨
+  embedding_dim: 300
+  hidden_dim: 256
+  num_layers: 2
+  num_classes: 2
+  dropout: 0.3
+
+training:
+  batch_size: 32
+  learning_rate: 0.001
+  num_epochs: 10
+  val_ratio: 0.2
+  random_state: 42
+
+  optimizer: adam
+  weight_decay: 0.0001
+
+  # 스케줄러 설정
+  scheduler: null # 'cosine', 'step', null
+
+  # 조기 종료
+  early_stopping:
+    patience: 5
+    min_delta: 0.001
+
+data:
+  data_dir: data
+  max_length: 512
+
+tokenizer:
+  vocab_size: 30000
+  max_length: 512
