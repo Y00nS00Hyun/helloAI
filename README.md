@@ -24,7 +24,9 @@ python utils/split_data.py --ratio 0.8
 # BiLSTM 모델 학습
 python train.py --model bilstm --device cuda
 
-# CNN 모델 학습
+# CNN 모델 학습 (C. 모델명 명확화)
+python train.py --model cnn --device cuda
+# 또는 호환성을 위해 transformer도 가능
 python train.py --model transformer --device cuda
 ```
 
@@ -117,26 +119,30 @@ headers = {"X-API-Key": "your-api-key-here"}
 # 모델 리로드
 requests.post("http://localhost:8000/reload_model", headers=headers)
 
-# 단일 텍스트 추론
+# 단일 텍스트 추론 (A. title+text 지원)
 response = requests.post(
     "http://localhost:8000/infer",
-    json={"text": "뉴스 텍스트..."},
+    json={
+        "text": "뉴스 본문...",
+        "title": "뉴스 제목"  # 선택사항
+    },
     headers=headers
 )
 
-# 검증 데이터 평가
+# 검증 데이터 평가 (최적 임계값 자동 계산)
 response = requests.post(
     "http://localhost:8000/validate",
     headers=headers
 )
+# 응답에 optimal_threshold 포함됨
 ```
 
 ## API 엔드포인트
 
-- `POST /infer`: 단일 텍스트 추론 (X-API-Key 필요)
-- `POST /infer_csv`: CSV 파일 일괄 추론 (X-API-Key 필요)
+- `POST /infer`: 단일 텍스트 추론 (title+text 지원, X-API-Key 필요)
+- `POST /infer_csv`: CSV 파일 일괄 추론 (title 자동 탐지, only_prediction 옵션, X-API-Key 필요)
 - `POST /reload_model`: 모델 다시 불러오기 (X-API-Key 필요)
-- `POST /validate`: 검증 데이터 평가 - **Macro F1 Score 반환** (X-API-Key 필요)
+- `POST /validate`: 검증 데이터 평가 - **Macro F1 Score 및 최적 임계값 반환** (X-API-Key 필요)
 - `GET /health`: 헬스 체크 (API Key 불필요)
 - `GET /`: 루트 엔드포인트 (API Key 불필요)
 

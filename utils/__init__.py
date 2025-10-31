@@ -6,10 +6,15 @@ from .data_loader import (
     split_train_val,
     prepare_data_for_training,
     preprocess_text,
-    normalize_label
+    normalize_label,
+    combine_title_text
 )
 from .preprocessing import TextTokenizer, SimpleTokenizer
-from .metrics import calculate_metrics, print_classification_report
+from .metrics import (
+    calculate_metrics,
+    print_classification_report,
+    find_optimal_threshold
+)
 from .model_utils import create_model, create_optimizer, create_scheduler
 from .config_utils import load_config
 from .constants import (
@@ -26,12 +31,14 @@ __all__ = [
     'prepare_data_for_training',
     'preprocess_text',
     'normalize_label',
+    'combine_title_text',
     # Tokenization
     'TextTokenizer',
     'SimpleTokenizer',
     # Metrics
     'calculate_metrics',
     'print_classification_report',
+    'find_optimal_threshold',
     # Model utilities
     'create_model',
     'create_optimizer',

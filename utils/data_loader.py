@@ -107,6 +107,23 @@ def load_datasets(data_dir: str = "data") -> pd.DataFrame:
     return combined_df
 
 
+def combine_title_text(title: Optional[str], text: str, sep: str = " ") -> str:
+    """
+    title과 text를 결합 (A. 입력 스키마 호환성)
+
+    Args:
+        title: 제목 (없으면 None)
+        text: 본문
+        sep: 구분자
+
+    Returns:
+        결합된 텍스트
+    """
+    if title and title.strip():
+        return f"{title.strip()}{sep}{text.strip()}"
+    return text.strip()
+
+
 def preprocess_text(text: str) -> str:
     """
     텍스트 전처리

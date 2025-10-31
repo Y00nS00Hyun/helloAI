@@ -2,10 +2,12 @@
 모델 학습 스크립트
 """
 import argparse
+import json
 import logging
 import os
+import random
 from pathlib import Path
-from typing import Tuple, Dict, Any
+from typing import Tuple, Dict, Any, Optional
 
 import torch
 import torch.nn as nn
@@ -19,7 +21,7 @@ from utils.data_loader import (
     prepare_data_for_training
 )
 from utils.preprocessing import TextTokenizer
-from utils.metrics import calculate_metrics, print_classification_report
+from utils.metrics import calculate_metrics, print_classification_report, find_optimal_threshold
 from utils.model_utils import create_model, create_optimizer, create_scheduler
 from utils.config_utils import load_config
 from utils.constants import DEFAULT_CONFIG
@@ -31,6 +33,24 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+
+# G. 재현성 강화
+def set_seed(seed: int = 42):
+    """
+    재현성을 위한 시드 고정 (G. 재현성 강화)
+
+    Args:
+        seed: 시드 값
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    logger.info(f"Seed fixed to {seed} for reproducibility")
 
 
 class NewsDataset(Dataset):
@@ -140,8 +160,9 @@ def validate(
     model: nn.Module,
     dataloader: DataLoader,
     criterion: nn.Module,
-    device: torch.device
-) -> Tuple[float, Dict[str, float]]:
+    device: torch.device,
+    return_probs: bool = False
+) -> Tuple[float, Dict[str, float], Optional[np.ndarray]]:
     """
     검증
 
@@ -150,14 +171,16 @@ def validate(
         dataloader: 데이터 로더
         criterion: 손실 함수
         device: 디바이스
+        return_probs: 확률 배열 반환 여부 (D. 임계값 튜닝용)
 
     Returns:
-        (평균 손실, 메트릭 딕셔너리)
+        (평균 손실, 메트릭 딕셔너리, 확률 배열)
     """
     model.eval()
     total_loss = 0.0
     all_preds: list = []
     all_labels: list = []
+    all_probs: list = []
 
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Validating"):
@@ -169,6 +192,13 @@ def validate(
             loss = criterion(outputs, labels)
 
             total_loss += loss.item()
+            probabilities = torch.softmax(outputs, dim=1)
+
+            # Fake 클래스 확률 저장 (D. 임계값 튜닝용)
+            if return_probs:
+                fake_probs = probabilities[:, 1].cpu().numpy()
+                all_probs.extend(fake_probs)
+
             preds = torch.argmax(outputs, dim=1).cpu().numpy()
             all_preds.extend(preds)
             all_labels.extend(labels.cpu().numpy())
@@ -179,7 +209,41 @@ def validate(
         np.array(all_preds)
     )
 
-    return avg_loss, metrics
+    probs = np.array(all_probs) if return_probs else None
+
+    return avg_loss, metrics, probs
+
+
+def save_metadata(
+    model_path: Path,
+    config: Dict[str, Any],
+    metrics: Dict[str, float],
+    optimal_threshold: float,
+    seed: int
+) -> None:
+    """
+    학습 메타데이터 저장 (G. 재현성 강화)
+
+    Args:
+        model_path: 모델 파일 경로
+        config: 설정 딕셔너리
+        metrics: 평가 메트릭
+        optimal_threshold: 최적 임계값
+        seed: 사용된 시드
+    """
+    metadata = {
+        'model_path': str(model_path),
+        'config': config,
+        'metrics': metrics,
+        'optimal_threshold': optimal_threshold,
+        'seed': seed,
+        'macro_f1': metrics.get('macro_f1', 0.0)
+    }
+
+    metadata_path = model_path.parent / 'metadata.json'
+    with open(metadata_path, 'w', encoding='utf-8') as f:
+        json.dump(metadata, f, indent=2, ensure_ascii=False)
+    logger.info(f"Metadata saved to {metadata_path}")
 
 
 def main():
@@ -206,11 +270,23 @@ def main():
         default='cuda' if torch.cuda.is_available() else 'cpu',
         help='Device to use'
     )
+    parser.add_argument(
+        '--seed',
+        type=int,
+        default=42,
+        help='Random seed for reproducibility (G. 재현성 강화)'
+    )
 
     args = parser.parse_args()
 
+    # G. 재현성 강화 - 시드 고정
+    set_seed(args.seed)
+
     # 설정 파일 로드
     config = load_config(config_path=args.config, model_name=args.model)
+
+    # 시드를 config에 저장
+    config['training']['random_state'] = args.seed
 
     device = torch.device(args.device)
     logger.info(f"Using device: {device}")
@@ -241,6 +317,24 @@ def main():
 
     if train_labels is None or val_labels is None:
         raise ValueError("Labels are required for training")
+
+    # E. 클래스 불균형 대응 - 클래스 가중치 계산
+    train_labels_arr = np.array(train_labels)
+    unique_labels, counts = np.unique(train_labels_arr, return_counts=True)
+    total = len(train_labels_arr)
+
+    class_weights = []
+    for label in [0, 1]:
+        if label in unique_labels:
+            idx = np.where(unique_labels == label)[0][0]
+            weight = total / (len(unique_labels) * counts[idx])
+        else:
+            weight = 1.0
+        class_weights.append(weight)
+
+    logger.info(f"Class distribution: {dict(zip(unique_labels, counts))}")
+    logger.info(
+        f"Class weights: Real={class_weights[0]:.3f}, Fake={class_weights[1]:.3f}")
 
     # 토크나이저 설정
     tokenizer_config = config.get('tokenizer', {})
@@ -286,8 +380,11 @@ def main():
         f"Total parameters: {sum(p.numel() for p in model.parameters()):,}"
     )
 
-    # 손실 함수 및 옵티마이저
-    criterion = nn.CrossEntropyLoss()
+    # E. 클래스 불균형 대응 - 가중치 적용 손실 함수
+    weight_tensor = torch.tensor(class_weights, dtype=torch.float32).to(device)
+    criterion = nn.CrossEntropyLoss(weight=weight_tensor)
+    logger.info("Using weighted CrossEntropyLoss for class imbalance")
+
     optimizer = create_optimizer(model, config)
     scheduler = create_scheduler(optimizer, config)
 
@@ -320,14 +417,29 @@ def main():
             f"Macro F1: {train_metrics['macro_f1']:.4f}"
         )
 
-        # 검증
-        val_loss, val_metrics = validate(
-            model, val_loader, criterion, device
+        # 검증 (확률 배열도 반환)
+        val_loss, val_metrics, val_probs = validate(
+            model, val_loader, criterion, device, return_probs=True
         )
         logger.info(
             f"Val Loss: {val_loss:.4f}, "
             f"Macro F1: {val_metrics['macro_f1']:.4f}"
         )
+
+        # D. 임계값 튜닝 - 최적 임계값 탐색
+        if val_probs is not None:
+            optimal_threshold, optimal_metrics = find_optimal_threshold(
+                np.array(val_labels),
+                val_probs,
+                metric='macro_f1'
+            )
+            logger.info(
+                f"Optimal threshold: {optimal_threshold:.4f} "
+                f"(Macro F1: {optimal_metrics['macro_f1']:.4f})"
+            )
+        else:
+            optimal_threshold = 0.5
+            optimal_metrics = val_metrics
 
         # 스케줄러 업데이트
         if scheduler:
@@ -336,11 +448,23 @@ def main():
             logger.info(f"Learning Rate: {current_lr:.6f}")
 
         # 최고 모델 저장 (Macro F1 Score 기준)
-        if val_metrics['macro_f1'] > best_f1 + min_delta:
-            best_f1 = val_metrics['macro_f1']
+        current_f1 = optimal_metrics['macro_f1']
+        if current_f1 > best_f1 + min_delta:
+            best_f1 = current_f1
             model_path = model_dir / 'best.pt'
             torch.save(model.state_dict(), model_path)
+
+            # G. 재현성 강화 - 메타데이터 저장
+            save_metadata(
+                model_path,
+                config,
+                optimal_metrics,
+                optimal_threshold,
+                args.seed
+            )
+
             logger.info(f"✓ Best model saved! Macro F1: {best_f1:.4f}")
+            logger.info(f"  Optimal threshold: {optimal_threshold:.4f}")
             patience_counter = 0
         else:
             patience_counter += 1
@@ -359,17 +483,32 @@ def main():
     best_model_path = model_dir / 'best.pt'
     if best_model_path.exists():
         model.load_state_dict(torch.load(best_model_path))
-        val_loss, val_metrics = validate(model, val_loader, criterion, device)
+        val_loss, val_metrics, val_probs = validate(
+            model, val_loader, criterion, device, return_probs=True
+        )
+
+        # 최적 임계값 재계산
+        if val_probs is not None:
+            optimal_threshold, optimal_metrics = find_optimal_threshold(
+                np.array(val_labels),
+                val_probs,
+                metric='macro_f1'
+            )
+            logger.info(f"\nFinal Optimal Threshold: {optimal_threshold:.4f}")
+        else:
+            optimal_threshold = 0.5
+            optimal_metrics = val_metrics
 
         logger.info("\nFinal Validation Results:")
         logger.info(
-            f"Macro F1 Score (대회 평가 기준): {val_metrics['macro_f1']:.4f}"
+            f"Macro F1 Score (대회 평가 기준): {optimal_metrics['macro_f1']:.4f}"
         )
-        logger.info(f"F1 Real: {val_metrics['f1_real']:.4f}")
-        logger.info(f"F1 Fake: {val_metrics['f1_fake']:.4f}")
-        logger.info(f"Accuracy: {val_metrics['accuracy']:.4f}")
-        logger.info(f"Precision: {val_metrics['precision']:.4f}")
-        logger.info(f"Recall: {val_metrics['recall']:.4f}")
+        logger.info(f"F1 Real: {optimal_metrics['f1_real']:.4f}")
+        logger.info(f"F1 Fake: {optimal_metrics['f1_fake']:.4f}")
+        logger.info(f"Accuracy: {optimal_metrics['accuracy']:.4f}")
+        logger.info(f"Precision: {optimal_metrics['precision']:.4f}")
+        logger.info(f"Recall: {optimal_metrics['recall']:.4f}")
+        logger.info(f"Optimal Threshold: {optimal_threshold:.4f}")
 
 
 if __name__ == '__main__':
